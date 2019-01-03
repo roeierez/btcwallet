@@ -431,23 +431,11 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 			}
 		}
 
-		for height := startHeight; height <= bestHeight; height++ {
+		for height := startHeight; birthdayStamp == nil; height++ {
 			hash, err := chainClient.GetBlockHash(int64(height))
 			if err != nil {
 				tx.Rollback()
 				return err
-			}
-
-			// If we're using the Neutrino backend, we can check if
-			// it's current or not. For other backends we'll assume
-			// it is current if the best height has reached the
-			// last checkpoint.
-			isCurrent := func(bestHeight int32) bool {
-				switch c := chainClient.(type) {
-				case *chain.NeutrinoClient:
-					return c.CS.IsCurrent()
-				}
-				return bestHeight >= checkHeight
 			}
 
 			// If we've found the best height the backend knows
@@ -456,7 +444,7 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 			// synchronize further before updating the best height
 			// based on the backend. Once we see that the backend
 			// has advanced, we can catch up to it.
-			for height == bestHeight && !isCurrent(bestHeight) {
+			for height == bestHeight {
 				time.Sleep(100 * time.Millisecond)
 				_, bestHeight, err = chainClient.GetBestBlock()
 				if err != nil {
@@ -473,7 +461,7 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 			// Check to see if this header's timestamp has surpassed
 			// our birthday or if we've surpassed one previously.
 			timestamp := header.Timestamp
-			if timestamp.After(birthday) || birthdayStamp != nil {
+			if timestamp.After(birthday) {
 				// If this is the first block past our birthday,
 				// record the block stamp so that we can use
 				// this as the starting point for the rescan.
@@ -485,36 +473,23 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 				// two days before the actual wallet birthday,
 				// to deal with potentially inaccurate header
 				// timestamps.
-				if birthdayStamp == nil {
-					birthdayStamp = &waddrmgr.BlockStamp{
-						Height:    height,
-						Hash:      *hash,
-						Timestamp: timestamp,
-					}
+				birthdayStamp = &waddrmgr.BlockStamp{
+					Height:    height,
+					Hash:      *hash,
+					Timestamp: timestamp,
+				}
 
-					log.Debugf("Found birthday block: "+
-						"height=%d, hash=%v",
-						birthdayStamp.Height,
-						birthdayStamp.Hash)
+				log.Debugf("Found birthday block: "+
+					"height=%d, hash=%v",
+					birthdayStamp.Height,
+					birthdayStamp.Hash)
 
-					err := w.Manager.SetBirthdayBlock(
-						ns, *birthdayStamp, true,
-					)
-					if err != nil {
-						tx.Rollback()
-						return err
-					}
-
-					//only set this when birthday has been found
-					err = w.Manager.SetSyncedTo(ns, &waddrmgr.BlockStamp{
-						Hash:      *hash,
-						Height:    height,
-						Timestamp: timestamp,
-					})
-					if err != nil {
-						tx.Rollback()
-						return err
-					}
+				err := w.Manager.SetBirthdayBlock(
+					ns, *birthdayStamp, true,
+				)
+				if err != nil {
+					tx.Rollback()
+					return err
 				}
 
 				// If we are in recovery mode and the check
@@ -527,16 +502,14 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 				}
 			}
 
-			if birthdayStamp == nil {
-				err = w.Manager.SetSyncedTo(ns, &waddrmgr.BlockStamp{
-					Hash:      *hash,
-					Height:    height,
-					Timestamp: timestamp,
-				})
-				if err != nil {
-					tx.Rollback()
-					return err
-				}
+			err = w.Manager.SetSyncedTo(ns, &waddrmgr.BlockStamp{
+				Hash:      *hash,
+				Height:    height,
+				Timestamp: timestamp,
+			})
+			if err != nil {
+				tx.Rollback()
+				return err
 			}
 
 			// If we are in recovery mode, attempt a recovery on
