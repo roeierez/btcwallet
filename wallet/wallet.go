@@ -334,15 +334,7 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 		unspent []wtxmgr.Credit
 	)
 
-	startHeight := w.Manager.SyncedTo().Height
-
-	// We'll mark this as our first sync if we don't have any unspent
-	// outputs as known by the wallet. This'll allow us to skip a full
-	// rescan at this height, and instead wait for the backend to catch up.
-	isInitialSync := birthdayStamp == nil
-
 	isRecovery := w.recoveryWindow > 0
-	birthday := w.Manager.Birthday()
 
 	// TODO(jrick): How should this handle a synced height earlier than
 	// the chain server best block?
@@ -354,214 +346,11 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 	// addresses ever created, including those that don't need to be watched
 	// anymore.  This code should be updated when this assumption is no
 	// longer true, but worst case would result in an unnecessary rescan.
-	if isInitialSync || isRecovery {
-		// Find the latest checkpoint's height. This lets us catch up to
-		// at least that checkpoint, since we're synchronizing from
-		// scratch, and lets us avoid a bunch of costly DB transactions
-		// in the case when we're using BDB for the walletdb backend and
-		// Neutrino for the chain.Interface backend, and the chain
-		// backend starts synchronizing at the same time as the wallet.
-		_, bestHeight, err := chainClient.GetBestBlock()
+	if birthdayStamp == nil {
+		birthdayStamp, err = w.syncToBirthday(isRecovery)
 		if err != nil {
 			return err
 		}
-
-		checkHeight := bestHeight
-		if len(w.chainParams.Checkpoints) > 0 {
-			checkHeight = w.chainParams.Checkpoints[len(
-				w.chainParams.Checkpoints)-1].Height
-		}
-
-		logHeight := checkHeight
-		if bestHeight > logHeight {
-			logHeight = bestHeight
-		}
-
-		log.Infof("Catching up block hashes to height %d, this will "+
-			"take a while...", logHeight)
-
-		// Initialize the first database transaction.
-		tx, err := w.db.BeginReadWriteTx()
-		if err != nil {
-			return err
-		}
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		// Only allocate the recoveryMgr if we are actually in recovery
-		// mode.
-		var recoveryMgr *RecoveryManager
-		if isRecovery {
-			log.Infof("RECOVERY MODE ENABLED -- rescanning for "+
-				"used addresses with recovery_window=%d",
-				w.recoveryWindow)
-
-			// Initialize the recovery manager with a default batch
-			// size of 2000.
-			recoveryMgr = NewRecoveryManager(
-				w.recoveryWindow, recoveryBatchSize,
-				w.chainParams,
-			)
-
-			// In the event that this recovery is being resumed, we
-			// will need to repopulate all found addresses from the
-			// database. For basic recovery, we will only do so for
-			// the default scopes.
-			scopedMgrs, err := w.defaultScopeManagers()
-			if err != nil {
-				return err
-			}
-
-			txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-			credits, err := w.TxStore.UnspentOutputs(txmgrNs)
-			if err != nil {
-				return err
-			}
-
-			err = recoveryMgr.Resurrect(ns, scopedMgrs, credits)
-			if err != nil {
-				return err
-			}
-		}
-
-		for height := startHeight; birthdayStamp == nil; height++ {
-			hash, err := chainClient.GetBlockHash(int64(height))
-			if err != nil {
-				tx.Rollback()
-				return err
-			}
-
-			// If we've found the best height the backend knows
-			// about, and the backend is still synchronizing, we'll
-			// wait. We can give it a little bit of time to
-			// synchronize further before updating the best height
-			// based on the backend. Once we see that the backend
-			// has advanced, we can catch up to it.
-			for height == bestHeight {
-				time.Sleep(100 * time.Millisecond)
-				_, bestHeight, err = chainClient.GetBestBlock()
-				if err != nil {
-					tx.Rollback()
-					return err
-				}
-			}
-
-			header, err := chainClient.GetBlockHeader(hash)
-			if err != nil {
-				return err
-			}
-
-			// Check to see if this header's timestamp has surpassed
-			// our birthday or if we've surpassed one previously.
-			timestamp := header.Timestamp
-			if timestamp.After(birthday) {
-				// If this is the first block past our birthday,
-				// record the block stamp so that we can use
-				// this as the starting point for the rescan.
-				// This will ensure we don't miss transactions
-				// that are sent to the wallet during an initial
-				// sync.
-				//
-				// NOTE: The birthday persisted by the wallet is
-				// two days before the actual wallet birthday,
-				// to deal with potentially inaccurate header
-				// timestamps.
-				birthdayStamp = &waddrmgr.BlockStamp{
-					Height:    height,
-					Hash:      *hash,
-					Timestamp: timestamp,
-				}
-
-				log.Debugf("Found birthday block: "+
-					"height=%d, hash=%v",
-					birthdayStamp.Height,
-					birthdayStamp.Hash)
-
-				err := w.Manager.SetBirthdayBlock(
-					ns, *birthdayStamp, true,
-				)
-				if err != nil {
-					tx.Rollback()
-					return err
-				}
-
-				// If we are in recovery mode and the check
-				// passes, we will add this block to our list of
-				// blocks to scan for recovered addresses.
-				if isRecovery {
-					recoveryMgr.AddToBlockBatch(
-						hash, height, timestamp,
-					)
-				}
-			}
-
-			err = w.Manager.SetSyncedTo(ns, &waddrmgr.BlockStamp{
-				Hash:      *hash,
-				Height:    height,
-				Timestamp: timestamp,
-			})
-			if err != nil {
-				tx.Rollback()
-				return err
-			}
-
-			// If we are in recovery mode, attempt a recovery on
-			// blocks that have been added to the recovery manager's
-			// block batch thus far. If block batch is empty, this
-			// will be a NOP.
-			if isRecovery && height%recoveryBatchSize == 0 {
-				err := w.recoverDefaultScopes(
-					chainClient, tx, ns,
-					recoveryMgr.BlockBatch(),
-					recoveryMgr.State(),
-				)
-				if err != nil {
-					tx.Rollback()
-					return err
-				}
-
-				// Clear the batch of all processed blocks.
-				recoveryMgr.ResetBlockBatch()
-			}
-
-			// Every 10K blocks, commit and start a new database TX.
-			if height%10000 == 0 {
-				err = tx.Commit()
-				if err != nil {
-					tx.Rollback()
-					return err
-				}
-
-				log.Infof("Caught up to height %d", height)
-
-				tx, err = w.db.BeginReadWriteTx()
-				if err != nil {
-					return err
-				}
-
-				ns = tx.ReadWriteBucket(waddrmgrNamespaceKey)
-			}
-		}
-
-		// Perform one last recovery attempt for all blocks that were
-		// not batched at the default granularity of 2000 blocks.
-		if isRecovery {
-			err := w.recoverDefaultScopes(
-				chainClient, tx, ns, recoveryMgr.BlockBatch(),
-				recoveryMgr.State(),
-			)
-			if err != nil {
-				tx.Rollback()
-				return err
-			}
-		}
-
-		// Commit (or roll back) the final database transaction.
-		err = tx.Commit()
-		if err != nil {
-			tx.Rollback()
-			return err
-		}
-		log.Info("Done catching up block hashes")
 	}
 
 	err = walletdb.View(w.db, func(dbtx walletdb.ReadTx) error {
@@ -673,6 +462,225 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 
 	// Trigger rescan from the last sync point.
 	return w.rescanWithTarget(addrs, unspent, nil)
+}
+
+func (w *Wallet) syncToBirthday(isRecovery bool) (*waddrmgr.BlockStamp, error) {
+	var birthdayStamp *waddrmgr.BlockStamp
+
+	birthday := w.Manager.Birthday()
+	startHeight := w.Manager.SyncedTo().Height
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		return nil, err
+	}
+	// Find the latest checkpoint's height. This lets us catch up to
+	// at least that checkpoint, since we're synchronizing from
+	// scratch, and lets us avoid a bunch of costly DB transactions
+	// in the case when we're using BDB for the walletdb backend and
+	// Neutrino for the chain.Interface backend, and the chain
+	// backend starts synchronizing at the same time as the wallet.
+	_, bestHeight, err := chainClient.GetBestBlock()
+	if err != nil {
+		return nil, err
+	}
+
+	checkHeight := bestHeight
+	if len(w.chainParams.Checkpoints) > 0 {
+		checkHeight = w.chainParams.Checkpoints[len(
+			w.chainParams.Checkpoints)-1].Height
+	}
+
+	logHeight := checkHeight
+	if bestHeight > logHeight {
+		logHeight = bestHeight
+	}
+
+	log.Infof("Catching up block hashes to height %d, this will "+
+		"take a while...", logHeight)
+
+	// Initialize the first database transaction.
+	tx, err := w.db.BeginReadWriteTx()
+	if err != nil {
+		return nil, err
+	}
+	ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+	// Only allocate the recoveryMgr if we are actually in recovery
+	// mode.
+	var recoveryMgr *RecoveryManager
+	if isRecovery {
+		log.Infof("RECOVERY MODE ENABLED -- rescanning for "+
+			"used addresses with recovery_window=%d",
+			w.recoveryWindow)
+
+		// Initialize the recovery manager with a default batch
+		// size of 2000.
+		recoveryMgr = NewRecoveryManager(
+			w.recoveryWindow, recoveryBatchSize,
+			w.chainParams,
+		)
+
+		// In the event that this recovery is being resumed, we
+		// will need to repopulate all found addresses from the
+		// database. For basic recovery, we will only do so for
+		// the default scopes.
+		scopedMgrs, err := w.defaultScopeManagers()
+		if err != nil {
+			return nil, err
+		}
+
+		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
+		credits, err := w.TxStore.UnspentOutputs(txmgrNs)
+		if err != nil {
+			return nil, err
+		}
+
+		err = recoveryMgr.Resurrect(ns, scopedMgrs, credits)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for height := startHeight; birthdayStamp == nil; height++ {
+		hash, err := chainClient.GetBlockHash(int64(height))
+		if err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+
+		// If we've found the best height the backend knows
+		// about, and the backend is still synchronizing, we'll
+		// wait. We can give it a little bit of time to
+		// synchronize further before updating the best height
+		// based on the backend. Once we see that the backend
+		// has advanced, we can catch up to it.
+		for height == bestHeight {
+			time.Sleep(100 * time.Millisecond)
+			_, bestHeight, err = chainClient.GetBestBlock()
+			if err != nil {
+				tx.Rollback()
+				return nil, err
+			}
+		}
+
+		header, err := chainClient.GetBlockHeader(hash)
+		if err != nil {
+			return nil, err
+		}
+
+		// Check to see if this header's timestamp has surpassed
+		// our birthday or if we've surpassed one previously.
+		timestamp := header.Timestamp
+		if timestamp.After(birthday) {
+			// If this is the first block past our birthday,
+			// record the block stamp so that we can use
+			// this as the starting point for the rescan.
+			// This will ensure we don't miss transactions
+			// that are sent to the wallet during an initial
+			// sync.
+			//
+			// NOTE: The birthday persisted by the wallet is
+			// two days before the actual wallet birthday,
+			// to deal with potentially inaccurate header
+			// timestamps.
+			birthdayStamp = &waddrmgr.BlockStamp{
+				Height:    height,
+				Hash:      *hash,
+				Timestamp: timestamp,
+			}
+
+			log.Debugf("Found birthday block: "+
+				"height=%d, hash=%v",
+				birthdayStamp.Height,
+				birthdayStamp.Hash)
+
+			err := w.Manager.SetBirthdayBlock(
+				ns, *birthdayStamp, true,
+			)
+			if err != nil {
+				tx.Rollback()
+				return nil, err
+			}
+
+			// If we are in recovery mode and the check
+			// passes, we will add this block to our list of
+			// blocks to scan for recovered addresses.
+			if isRecovery {
+				recoveryMgr.AddToBlockBatch(
+					hash, height, timestamp,
+				)
+			}
+		}
+
+		err = w.Manager.SetSyncedTo(ns, &waddrmgr.BlockStamp{
+			Hash:      *hash,
+			Height:    height,
+			Timestamp: timestamp,
+		})
+		if err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+
+		// If we are in recovery mode, attempt a recovery on
+		// blocks that have been added to the recovery manager's
+		// block batch thus far. If block batch is empty, this
+		// will be a NOP.
+		if isRecovery && height%recoveryBatchSize == 0 {
+			err := w.recoverDefaultScopes(
+				chainClient, tx, ns,
+				recoveryMgr.BlockBatch(),
+				recoveryMgr.State(),
+			)
+			if err != nil {
+				tx.Rollback()
+				return nil, err
+			}
+
+			// Clear the batch of all processed blocks.
+			recoveryMgr.ResetBlockBatch()
+		}
+
+		// Every 10K blocks, commit and start a new database TX.
+		if height%10000 == 0 {
+			err = tx.Commit()
+			if err != nil {
+				tx.Rollback()
+				return nil, err
+			}
+
+			log.Infof("Caught up to height %d", height)
+
+			tx, err = w.db.BeginReadWriteTx()
+			if err != nil {
+				return nil, err
+			}
+
+			ns = tx.ReadWriteBucket(waddrmgrNamespaceKey)
+		}
+	}
+
+	// Perform one last recovery attempt for all blocks that were
+	// not batched at the default granularity of 2000 blocks.
+	if isRecovery {
+		err := w.recoverDefaultScopes(
+			chainClient, tx, ns, recoveryMgr.BlockBatch(),
+			recoveryMgr.State(),
+		)
+		if err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+	}
+
+	// Commit (or roll back) the final database transaction.
+	err = tx.Commit()
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	log.Info("Done catching up block hashes")
+	return birthdayStamp, nil
 }
 
 // defaultScopeManagers fetches the ScopedKeyManagers from the wallet using the
